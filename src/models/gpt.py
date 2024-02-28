@@ -416,42 +416,24 @@ class GPT(nn.Module):
         ]  # [batch_size, seq_len, hidden_size]
         return pos_encodings
 
-    def forward(
+    def embed_inputs(
         self,
         patches: torch.Tensor,
         actions: torch.LongTensor,
         classes: torch.Tensor,
         positions: Optional[torch.LongTensor] = None,
-    ) -> tuple:
-        """Do a forward pass of the model.
-        Predicts the next actions and labels for each token.
-
-        ---
-        Args:
-            patches: Consecutive patches of the image.
-                Shape of [batch_size, n_tokens, n_channels, patch_size, patch_size].
-            actions: Action taken before entering each patch.
-                Shape of [batch_size, n_tokens].
-                If multiple actions are taken, shape is [batch_size, n_tokens, n_action]
-            classes: Label of the objects to look for in each batch.
-                Shape of [batch_size,].
-            positions: Tensor of coordinates (y, x) positions.
-                Optional, used only if `self.use_pos_emb` is True.
-                Shape of [batch_size, n_tokens, 2].
-
-        ---
-        Returns:
-            The predicted action logits for each token.
-                Shape of [batch_size, n_tokens, action_embed_size].
-                If multiple actions are taken: [batch_size, n_tokens, n_actions, action_embed_size].
-        """
-        seq_len = actions.shape[1]
-        assert (
-            seq_len <= self.block_size
-        ), f"Cannot forward sequence of length {seq_len}, block size is only {self.block_size}"
-        assert (not self.use_pos_emb) or (positions is not None)
+        prev_embeddings: torch.Tensor = None,
+    ):
+        if self.config.no_recurrent_embedding:
+            prev_embeddings = None
 
         # Embed all inputs. Each embedding is of shape [batch_size, seq_len, n_embd].
+        if prev_embeddings is not None:
+            actions = actions[:, -1:]
+            patches = patches[:, -1:]
+            if self.use_pos_emb:
+                positions = positions[:, -1:]
+
         embeddings = []
         if len(actions.shape) == 2:
             # single class action
@@ -487,10 +469,57 @@ class GPT(nn.Module):
             )  # [batch_size, seq_len, len(embeddings), n_embd]
             final_emb = torch.mean(final_emb, dim=2)  # [batch_size, seq_len, n_embd]
 
-        # Add contitional token.
-        class_emb = self.embed_class(classes)  # Shape of [batch_size, n_embd].
-        class_emb = class_emb.unsqueeze(1)  # Shape of [batch_size, 1, n_embd].
-        final_emb = torch.cat((class_emb, final_emb), dim=1)
+        if prev_embeddings is not None:
+            final_emb = torch.cat((prev_embeddings, final_emb), dim=1)
+        else:
+            # Add conditional token.
+            class_emb = self.embed_class(classes)  # Shape of [batch_size, n_embd].
+            class_emb = class_emb.unsqueeze(1)  # Shape of [batch_size, 1, n_embd].
+            final_emb = torch.cat((class_emb, final_emb), dim=1)
+        return final_emb
+
+    def forward(
+        self,
+        patches: torch.Tensor,
+        actions: torch.LongTensor,
+        classes: torch.Tensor,
+        positions: Optional[torch.LongTensor] = None,
+        prev_embeddings: torch.Tensor = None,
+    ) -> tuple:
+        """Do a forward pass of the model.
+        Predicts the next actions and labels for each token.
+
+        ---
+        Args:
+            patches: Consecutive patches of the image.
+                Shape of [batch_size, n_tokens, n_channels, patch_size, patch_size].
+            actions: Action taken before entering each patch.
+                Shape of [batch_size, n_tokens].
+                If multiple actions are taken, shape is [batch_size, n_tokens, n_action]
+            classes: Label of the objects to look for in each batch.
+                Shape of [batch_size,].
+            positions: Tensor of coordinates (y, x) positions.
+                Optional, used only if `self.use_pos_emb` is True.
+                Shape of [batch_size, n_tokens, 2].
+            prev_embeddings: previous embeddings, to avoid recompute the embeddings for
+                the same patches
+
+        ---
+        Returns:
+            The predicted action logits for each token.
+                Shape of [batch_size, n_tokens, action_embed_size].
+                If multiple actions are taken: [batch_size, n_tokens, n_actions, action_embed_size].
+            The input embedding to continue sequential inference
+        """
+        seq_len = actions.shape[1]
+        assert (
+            seq_len <= self.block_size
+        ), f"Cannot forward sequence of length {seq_len}, block size is only {self.block_size}"
+        assert (not self.use_pos_emb) or (positions is not None)
+
+        final_emb = self.embed_inputs(
+            patches, actions, classes, positions, prev_embeddings
+        )
 
         # forward the GPT model itself
         x = self.transformer.drop(final_emb)
@@ -502,7 +531,7 @@ class GPT(nn.Module):
         # Do not keep the first offset tokens.
         action_logits = action_logits[:, self.token_offset :].contiguous()
 
-        return action_logits
+        return action_logits, final_emb
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

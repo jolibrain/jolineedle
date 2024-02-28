@@ -3,11 +3,15 @@ import time
 import json
 from collections import defaultdict
 from pathlib import Path
+from typing import List, Optional
 
 import torch
+import torch.nn as nn
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
+from kornia import augmentation
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 from .models.gpt import GPT
 from .utils import CfgNode as CN
@@ -39,10 +43,15 @@ class Trainer:
 
         # Test datasets env ids
         rng = np.random.default_rng(self.config.seed)
-        image_ids = list(range(len(self.test_dataset)))
-        self.test_env_ids = rng.choice(image_ids, size=(self.config.test_samples,))
-        image_ids = list(range(len(self.train_dataset)))
-        self.train_env_ids = rng.choice(image_ids, size=(self.config.test_samples,))
+
+        if self.test_dataset is not None:
+            image_ids = list(range(len(self.test_dataset)))
+            self.test_env_ids = rng.choice(image_ids, size=(self.config.test_samples,))
+
+        if self.train_dataset is not None:
+            image_ids = list(range(len(self.train_dataset)))
+            self.train_env_ids = rng.choice(image_ids, size=(self.config.test_samples,))
+
         self.rng = rng
 
         self.best_metric_history = []
@@ -112,9 +121,11 @@ class Trainer:
 
     def save_checkpoint(self, ckpt_path: str):
         state = {
-            "model": self.model.module.state_dict()
-            if isinstance(self.model, DDP)
-            else self.model.state_dict(),
+            "model": (
+                self.model.module.state_dict()
+                if isinstance(self.model, DDP)
+                else self.model.state_dict()
+            ),
             "optimizer-gpt": self.optim_gpt.state_dict(),
             "optimizer-yolox": self.optim_yolox.state_dict(),
         }
@@ -126,7 +137,7 @@ class Trainer:
 
     def prepare_validation(self):
         """
-        Reload best checkpoint and test it over the entire dataset
+        Reload best checkpoint to test it over the entire dataset
         """
         # Reload best checkpoint
         work_dir = Path(self.config.work_dir)
@@ -135,6 +146,7 @@ class Trainer:
 
         if ckpt_path.exists():
             # TODO function trainer.load_checkpoint?
+            print("Loading best checkpoint for validation:", ckpt_path)
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             # Load the model checkpoint and add the DDP wrapper.
             if isinstance(self.model, DDP):
@@ -151,3 +163,118 @@ class Trainer:
 
         # Change test data to all dataset
         self.test_env_ids = list(range(len(self.test_dataset)))
+
+    # === Detection
+
+    def yolox_model(self):
+        # XXX: this may not work with DDP, yolox would need to be separated
+        # from decision
+        return (
+            self.model.module.yolox if isinstance(self.model, DDP) else self.model.yolox
+        )
+
+    def init_detection(self):
+        self.detection_augment = nn.Sequential(
+            augmentation.RandomPlanckianJitter(mode="CIED"),
+            augmentation.RandomGrayscale(p=0.2),
+            augmentation.RandomGaussianBlur((3, 3), sigma=(0.1, 2.0)),
+            augmentation.RandomPlasmaShadow(
+                shade_intensity=(-0.2, 0.0), shade_quantity=(0.0, 0.4), p=0.5
+            ),
+            augmentation.RandomGaussianNoise(mean=0.0, std=0.05, p=0.5),
+            augmentation.RandomMotionBlur(3, (-180.0, 180.0), 0.0, p=0.3),
+        )
+
+    def compute_detection_metrics(
+        outputs: List[Optional[torch.Tensor]],
+        targets: List[torch.Tensor],
+    ) -> dict:
+        """Compute detection metrics.
+
+        ---
+        Args:
+            outputs: List of predicted bboxes per image. Each tensor is all the
+                predicted bboxes for one image, None if no prediction.
+                Shape of [n_bboxes, 4 + 1 + ?].
+                The last dimension is organized as follows:
+                    - [xmin, ymin, xmax, ymax]: The coordinates of the bbox.
+                    - score
+            targets: The true bboxes to be detected.
+                Shape of [n_bboxes, 4 + 1]
+        """
+        n_bboxes = sum([len(t) for t in targets])
+
+        if n_bboxes == 0:
+            # No bbox in the batch => fix the map to 0 (torchmetrics would compute -1).
+            metrics["map"] = torch.FloatTensor([0.0]).to(targets.device)
+            return metrics
+
+        preds = []
+        tgts = []
+
+        for i, image_outputs in enumerate(outputs):
+            image_targets = targets[i]
+
+            if image_outputs is None:
+                image_outputs = torch.zeros((1, 7), device=image_targets.device)
+
+            prediction = {
+                "boxes": image_outputs[:, :4],
+                "scores": image_outputs[:, 4],
+                "labels": torch.zeros(
+                    len(image_outputs),
+                    device=image_outputs.device,
+                    dtype=torch.long,
+                ),
+            }
+
+            # Keep only the true bboxes.
+            # TODO take class into account
+            target = {
+                "boxes": image_targets[:, 1:5],
+                "labels": torch.zeros(
+                    len(image_targets),
+                    device=image_targets.device,
+                    dtype=torch.long,
+                ),
+            }
+
+            preds.append(prediction)
+            tgts.append(target)
+
+        metrics = dict()
+        map = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+        metrics["map"] = map(preds, tgts)["map_50"]
+        return metrics
+
+    def patch_bboxes2full_image(
+        outputs: List[List[Optional[torch.Tensor]]],
+        offsets: torch.Tensor,
+        masks: torch.Tensor = None,
+    ) -> List[Optional[torch.Tensor]]:
+        """
+        Args:
+            outputs: List of predicted bboxes.
+                The first list is the batch.
+                The second list is the episode length.
+                The tensors are predictions for each patches of the episodes of the batch.
+        """
+        new_outputs = []
+        for i, image_outputs in enumerate(outputs):
+            new_img_outputs = []
+
+            for j, patch_outputs in enumerate(image_outputs):
+                if masks is not None and not masks[i, j]:
+                    continue
+                if patch_outputs is not None:
+                    patch_outputs = patch_outputs.clone()
+                    patch_outputs[:, :2] += offsets[i, j]
+                    patch_outputs[:, 2:4] += offsets[i, j]
+                    new_img_outputs.append(patch_outputs)
+
+            if len(new_img_outputs) > 0:
+                new_outputs.append(torch.cat(new_img_outputs))
+            else:
+                new_outputs.append(None)
+
+        return new_outputs

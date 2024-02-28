@@ -61,13 +61,15 @@ The STOP action could not be implemented easily with the supervised paradigm. Wi
 
 - Simpler reward (2024/04): as the reward gets pretty complicated with the STOP action, we introduce a discount factor and change the reward to a simpler one: model gets a reward each time it finds a patch containing a bounding box.
 
-**Results** (on full test set - Lard):
+**Results** (on full test set - Lard): **90.1%** patches found, **12.4** episode length
 
 ### Adding detection
 
 We train a detection model (YOLOX) jointly with the decision model, just as in the supervised pipeline. The detection model is training on patches with bbox + randomly sampled negative patches.
 
-TODO **Results**
+*I fixed a bug that deteriorated results a bit in eval mode, resulting in improving stats*
+
+**Results** (on full test set - Lard, 2024-04-26): **96.6%** patches found, **13.5** episode length, **81.9%** MAP
 
 ## Training time
 
@@ -75,4 +77,41 @@ It seems like the training time is Disk bound (and maybe CPU-bound) rather than 
 
 As of 2024-02-16, we're around 3sec/it, and 3 days for a full 100000 iters training at batch size 4
 
+## Updated results 2024/05/21
 
+Found a discrepancy between metrics from supervised pipeline and metrics from the reinforce learning pipeline:
+- supervised metrics: (with confidence threshold = 0.1)
+```
+{
+    "episode_length": 4.119256973266602,
+    "prop_patches_found": 0.875,
+    "prop_bbox_found": 0.9565004706382751,
+    "map": 0.22614137828350067,
+    "yolo_map": 0.8955793976783752
+}
+```
+
+Remarks:
+- `prop_patches_found` seems lower than measured before, why?
+- `map` is low: this is due to a large amount of false positives that were not caught before... maybe due to the change of confidence threshold?
+- `yolo_map` lower than before: maybe because now we compute map on whole image?
+
+- reinforce metrics (confidence threshold = 0.1)
+```
+{
+    "episode_length": 13.681329727172852,
+    "prop_patches_found": 0.9655424952507019,
+    "prop_bbox_found": 0.9814271926879883,
+    "stop_used": 0.9740958213806152,
+    "stop_misused": 0.04007820039987564,
+    "map": 0.8275758624076843,
+    "yolo_map": 0.9343946576118469
+}
+```
+
+### Merge boxes
+
+As the model produces bounding box per patch, the map has not the same meaning as in the standard full image detection task.
+To uniformize the way metrics are computed, we merge adjacent bboxes from adjacent patches.
+
+With merge boxes: map becomes 0.832. As expected, we observe a slight improving in metrics, because merged boxes can help for the parts of the boxes that don't include the runway (because of axis alignment of boxes versus the shape of the runway, a large part of the bbox can be not actual runway)

@@ -258,10 +258,10 @@ class NeedleSimpleEnv:
                 local_bboxes[bbox_id] = torch.FloatTensor(
                     [
                         0,  # The class id.
-                        (x1 + x2) / 2 - x1_patch,
-                        (y1 + y2) / 2 - y1_patch,
-                        (x2 - x1),
-                        (y2 - y1),
+                        x1 - x1_patch,
+                        y1 - y1_patch,
+                        x2 - x1_patch,
+                        y2 - y1_patch,
                         1,  # The objectivness.
                     ]
                 )

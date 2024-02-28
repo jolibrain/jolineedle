@@ -56,6 +56,12 @@ def get_args(args=None):
         help="Minimum size of the image, smaller images will be resized to this size",
     )
     parser.add_argument(
+        "--no-detection",
+        action="store_false",
+        dest="detection_enabled",
+        help="Disable detection model, use only decision (only for RL pipeline for now)",
+    )
+    parser.add_argument(
         "--image-processor",
         type=str,
         default="yolox",
@@ -140,7 +146,10 @@ def get_args(args=None):
         help="Weight of the STOP action in cross-entropy loss for supervised training",
     )
     parser.add_argument(
-        "--reward-norm", action="store_true", help="Normalize rewards in RL pipeline"
+        "--no-reward-norm",
+        action="store_false",
+        dest="reward_norm",
+        help="Disable reward normalization in RL pipeline",
     )
     parser.add_argument(
         "--entropy-weight",
@@ -162,6 +171,11 @@ def get_args(args=None):
         "--max-keypoints",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--merge-bboxes",
+        action="store_true",
+        help="Merge bounding boxes before computing metrics. This yields more representative mAP (we can directly compare it with a detector mAP).\n\nSince it adds post-processing (= source of confusion) to the results, we might not want to merge bbox in every case. Take extra care when the boxes could be superposed or close to each other.",
     )
     parser.add_argument(
         "--loss",
@@ -248,6 +262,11 @@ def get_args(args=None):
         help="Resume precedent training, give the precedent checkpoint directory as arg",
     )
     parser.add_argument(
+        "--detection-checkpoint",
+        type=str,
+        help="Load detection model from given checkpoint file (can be different from --resume-training model)",
+    )
+    parser.add_argument(
         "--dataset-dir",
         type=Path,
         help="Path to the dataset",
@@ -278,10 +297,17 @@ def get_args(args=None):
     )
     parser.add_argument("--measure-flops", action="store_true", help="Measure flops")
 
+    # Deprecated options
+    parser.add_argument(
+        "--no-recurrent-embedding",
+        action="store_true",
+        help="Normally the embeddings are reused from one patch to another to save resources. This should not have an impact on training, but in some cases the result is different without the optimization",
+    )
+
     return parser.parse_args(args)
 
 
-def main(args):
+def args_to_config(args):
     # TODO reorder options into semantic groups
     train_config = SupervisedTrainer.get_default_config()
     train_config.training_mode = args.training_mode
@@ -290,6 +316,7 @@ def main(args):
     train_config.learning_rate = args.lr
     train_config.max_iters = args.max_iters
     train_config.batch_size = args.batch_size
+    train_config.detection_enabled = args.detection_enabled
     train_config.gradient_accumulation = args.gradient_accumulation
     train_config.env_name = args.env_name
     train_config.work_dir = args.work_dir
@@ -300,6 +327,8 @@ def main(args):
     train_config.failure_select_rate = args.failure_select_rate
     train_config.eval_training_set = args.eval_training_set
     train_config.resume_training = args.resume_training
+    train_config.detection_checkpoint = args.detection_checkpoint
+    train_config.merge_bboxes = args.merge_bboxes
     train_config.seed = args.seed
     train_config.train_size = args.train_size
     train_config.num_workers = args.num_workers
@@ -354,10 +383,18 @@ def main(args):
     model_config.patch_size = train_config.patch_size
     model_config.image_cols = train_config.image_cols
 
+    model_config.no_recurrent_embedding = args.no_recurrent_embedding
+
+    return train_config, model_config
+
+
+def main(args):
+    train_config, model_config = args_to_config(args)
     torch.manual_seed(train_config.seed)
     random.seed(train_config.seed)
     np.random.seed(train_config.seed)
 
+    # TODO do that only once on the rank 0 thread
     dataset_dir = args.dataset_dir
     train_dataset, test_dataset = build_datasets(
         dataset_dir,
@@ -428,9 +465,7 @@ def compute_flops(model, model_config, train_config, device):
     print(f"Backbone MACs: {pretty_bkb_macs}, Params: {pretty_bkb_params}")
 
     # head MACs
-    yolo_macs, yolo_params = profile(
-        model.yolox, inputs=[one_patch.unsqueeze(0)], verbose=False
-    )
+    yolo_macs, yolo_params = profile(model.yolox, inputs=[one_patch], verbose=False)
     pretty_head_macs, pretty_head_params = clever_format(
         [yolo_macs - bkb_macs, yolo_params - bkb_params], "%.3f"
     )
@@ -494,10 +529,13 @@ def compute_flops(model, model_config, train_config, device):
     print(f"Yolox total MACS: {pretty_yolo_macs}, Params: {pretty_yolo_params}")
 
 
-def load_checkpoint(train_config, trainer, visdom=None):
+def load_checkpoint(train_config, trainer, visdom=None, best=False):
     print("Resuming from ", train_config.resume_training)
     log_dir = Path(train_config.resume_training)
-    checkpoint = torch.load(log_dir / "checkpoint.pt", map_location="cpu")
+    if best:
+        checkpoint = torch.load(log_dir / "checkpoint_best.pt", map_location="cpu")
+    else:
+        checkpoint = torch.load(log_dir / "checkpoint.pt", map_location="cpu")
 
     # Load the model checkpoint and remove the DDP wrapper.
     model_checkpoint = dict()
@@ -522,6 +560,28 @@ def load_checkpoint(train_config, trainer, visdom=None):
         visdom = VisdomPlotter.load(log_dir / "visdom.pkl", train_config.env_name)
 
     return visdom
+
+
+def load_detection_checkpoint(train_config, trainer):
+    print("Load detection checkpoint from", train_config.detection_checkpoint)
+    checkpoint = torch.load(train_config.detection_checkpoint, map_location="cpu")
+
+    # TODO allow to load only jit model from dede or pretrained checkpoint
+    # Load the model checkpoint and remove the DDP wrapper.
+    model_checkpoint = dict()
+    for module_name, params in checkpoint["model"].items():
+        module_name = module_name.replace("module.", "")
+
+        if module_name.startswith("yolox."):
+            module_name = module_name[6:]
+            model_checkpoint[module_name] = params
+
+    trainer.yolox_model().load_state_dict(model_checkpoint)
+    if "optimize-yolox" in checkpoint:
+        trainer.optim_yolox.load_state_dict(checkpoint["optimizer-yolox"])
+
+    trainer.optim_yolox.lr = train_config.yolo_lr
+    trainer.optim_yolox.weight_decay = train_config.weight_decay
 
 
 def launch_ddp_training(rank, world_size, train_config, model_config, dataset_dir):
@@ -571,8 +631,12 @@ def launch_ddp_training(rank, world_size, train_config, model_config, dataset_di
         if logger:
             logger.visdom = visdom
 
+    if train_config.detection_checkpoint is not None:
+        load_detection_checkpoint(train_config, trainer)
+
     if rank == 0 and train_config.measure_flops:
         compute_flops(model, model_config, train_config, trainer.device)
+        return
 
     trainer.run(rank, world_size, train_config.port_ddp)
 

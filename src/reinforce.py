@@ -2,6 +2,7 @@ from collections import defaultdict
 from pathlib import Path
 from functools import partial
 from typing import Any, Iterator, Tuple, List, Dict
+import copy
 
 import numpy as np
 import einops
@@ -20,7 +21,15 @@ from tqdm import tqdm
 from .env.general_env import NeedleGeneralEnv
 from .trainer import Trainer
 from .logger import Logger
-from .utils import CfgNode as CN, bboxes_to_tensor, plot_model_prediction
+from .utils import (
+    CfgNode as CN,
+    bboxes_to_tensor,
+    parse_bbox_predictions,
+    parse_bbox_targets,
+    plot_model_prediction,
+    save_batch,
+    merge_boxes_batched,
+)
 from .models.gpt import GPT
 from .dataset import NeedleDataset
 
@@ -44,16 +53,12 @@ class ReinforceTrainer(Trainer):
         )
 
         self.patch_size = model.patch_size
-        # RL options
         self.max_ep_len = self.config.max_seq_len
         self.entropy_weight = self.config.entropy_weight
         self.n_glimps_levels = 1  # n_glimps_levels
         self.stop_enabled = self.config.stop_enabled
-        # ===
-
         self.max_iters = config.max_iters
         self.log_every = config.test_every
-        # self.plot_every = plot_every
         self.device = self.config.gpu_ids[rank]
 
         self.checkpoint_dir = Path(config.work_dir) / config.env_name
@@ -66,19 +71,25 @@ class ReinforceTrainer(Trainer):
         self.last_return_std = 1
 
     def sample_from_logits(
-        self,
-        logits: torch.Tensor,
+        self, logits: torch.Tensor, take_best_action: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        take_best_action: always take the best action instead of sampling
+        """
 
         # sample from the last token
         last_action_logits = logits[:, -1, :]
         categorical = Categorical(logits=last_action_logits)
-        actions = categorical.sample()
+        if take_best_action:
+            actions = last_action_logits.argmax(dim=1)
+        else:
+            actions = categorical.sample()
         logprobs = categorical.log_prob(actions)
         entropies = categorical.entropy()
 
         return actions, logprobs, entropies
 
+    @torch.no_grad()
     def _compute_last_returns_mean_std(self):
         """
         Compute returns mean and std over last batch and reset last returns values
@@ -94,7 +105,12 @@ class ReinforceTrainer(Trainer):
         self.last_return_mean, self.last_return_std = mean, std
         self.last_return_values = []
 
-    def rollout(self, env: NeedleGeneralEnv) -> Dict[str, torch.Tensor]:
+    def rollout(
+        self,
+        env: NeedleGeneralEnv,
+        do_detection: bool = False,
+        sample_actions: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         """Do a rollout on the given environment.
         Returns the rewards, returns and logprobs of the rollout.
         """
@@ -111,16 +127,44 @@ class ReinforceTrainer(Trainer):
         )
         # TODO classes
         classes = torch.zeros((env.batch_size,), dtype=torch.int64, device=self.device)
-
         patches, infos = env.reset()
         positions = infos["positions"].unsqueeze(1)
+        bboxes = [[] for i in range(env.batch_size)]
+        masks.append(
+            torch.tensor(
+                [True for i in range(env.batch_size)],
+                device=self.device,
+                dtype=torch.bool,
+            )
+        )
+
+        if do_detection:
+            yolox = self.yolox_model()
+            # Add prediction of the first batch
+            bbox_out, _, yolo_loss = yolox(patches[0], None)
+            for i in range(env.batch_size):
+                bboxes[i].append(bbox_out[i])
+
+        embeddings = None
 
         for step_id in range(env.max_ep_len):
-            action_logits = self.model(patches, actions, classes, positions)
-            new_actions, logprobs_, entropies_ = self.sample_from_logits(action_logits)
+            action_logits, embeddings = self.model(
+                patches, actions, classes, positions, embeddings
+            )
+            new_actions, logprobs_, entropies_ = self.sample_from_logits(
+                action_logits, take_best_action=not sample_actions
+            )
+
             new_patches, step_rewards, terminated, truncated, infos = env.step(
                 new_actions
             )
+
+            if do_detection:
+                # XXX: the patch includes "glimps_level" at dim 1 which
+                # is not supported by yolox (and useless?)
+                bbox_out, _, yolo_loss = yolox(new_patches[:, 0], None)
+                for i in range(env.batch_size):
+                    bboxes[i].append(bbox_out[i])
 
             rewards.append(step_rewards)
             logprobs.append(logprobs_)  # .sum(dim=1)
@@ -146,15 +190,16 @@ class ReinforceTrainer(Trainer):
 
         # The last terminated state is not counted in the masks,
         # so we need to shift the masks by 1 to make sure we include id.
-        masks = torch.roll(masks, shifts=1, dims=(1,))
-        masks[:, 0] = True
+        logit_masks = torch.roll(masks[:, 1:], shifts=1, dims=(1,))
+        logit_masks[:, 0] = True
 
-        rewards = torch.flip(rewards, dims=(1,))
-        masks = torch.flip(masks, dims=(1,))
-        cumulated_returns = torch.cumsum(rewards * masks, dim=1)
-        cumulated_returns = torch.flip(cumulated_returns, dims=(1,))
-        rewards = torch.flip(rewards, dims=(1,))
-        masks = torch.flip(masks, dims=(1,))
+        backward_rewards = torch.flip(rewards, dims=(1,))
+        # shift to right and drop first element -> drop last element
+        backward_masks = torch.flip(logit_masks, dims=(1,))
+        backward_cumulated_returns = torch.cumsum(
+            backward_rewards * backward_masks, dim=1
+        )
+        cumulated_returns = torch.flip(backward_cumulated_returns, dims=(1,))
 
         return {
             "rewards": rewards,
@@ -162,10 +207,15 @@ class ReinforceTrainer(Trainer):
             "logprobs": logprobs,
             "entropies": entropies,
             "masks": masks,
+            # masks for reward and logits
+            "logit_masks": logit_masks,
+            "positions": positions,
+            "bboxes": bboxes,
+            "patches": patches,
         }
 
     def compute_metrics(
-        self, rollout: Dict[str, torch.Tensor]
+        self, rollout: Dict[str, torch.Tensor], env: NeedleGeneralEnv = None
     ) -> Dict[str, torch.Tensor]:
         """Compute the metrics of the given rollout.
 
@@ -179,7 +229,7 @@ class ReinforceTrainer(Trainer):
         """
         metrics = dict()
         returns = rollout["returns"]
-        masks = rollout["masks"]
+        masks = rollout["logit_masks"]
 
         if self.config.reward_norm:
             self.last_return_values.append(returns[masks].clone().detach())
@@ -188,6 +238,8 @@ class ReinforceTrainer(Trainer):
         else:
             advantages = returns
 
+        # Train loss
+        # TODO compute_loss()
         metrics["action_loss"] = (
             -(rollout["logprobs"] * advantages * masks).sum() / masks.sum()
         )
@@ -198,6 +250,18 @@ class ReinforceTrainer(Trainer):
         )
         metrics["returns"] = (rollout["rewards"] * masks).sum(dim=1).mean()
         metrics["episode_length"] = masks.sum(dim=1).float().mean()
+
+        # Test metrics
+        if env:
+            metrics["prop_patches_found"] = env.prop_patches_found[0]
+            metrics["prop_bbox_found"] = env.prop_bboxes_found[0]
+
+            if self.stop_enabled:
+                metrics["stop_used"] = env.terminated[0].to(torch.float32)
+                metrics["stop_misused"] = (
+                    env.terminated[0] and env.prop_patches_found[0] < 1
+                ).to(torch.float32)
+
         return metrics
 
     def run(self, rank: int, world_size: int, ddp_port: int):
@@ -210,6 +274,7 @@ class ReinforceTrainer(Trainer):
             config: A dictionary of hyperparameters.
             mode: The mode of the Weights & Biases run.
         """
+        self.init_detection()
         self.ddp_setup(rank, world_size, ddp_port)
         # XXX: DDP doesnt work: "one of the variables needed for gradient computation has been modified by an inplace operation"
         # self.model = DDP(self.model, device_ids=[self.device])
@@ -260,15 +325,29 @@ class ReinforceTrainer(Trainer):
 
             rollout = self.rollout(env)
             metrics = self.compute_metrics(rollout)
+            loss = metrics["loss"]
 
-            (metrics["loss"] / self.config.gradient_accumulation).backward()
+            if self.config.detection_enabled:
+                patches_yolox, bboxes_yolox = env.get_detection_batch()
+                with torch.no_grad():
+                    patches_yolox = self.detection_augment(patches_yolox)
 
-            metrics = dict()
+                yolox = self.yolox_model()
+                _, _, yolo_loss = yolox(patches_yolox, bboxes_yolox)
+
+                total_loss = yolo_loss["total_loss"]
+                loss += total_loss
+
+            (loss / self.config.gradient_accumulation).backward()
 
             if self.iter_num % self.config.gradient_accumulation == 0:
                 clip_grad.clip_grad_value_(self.model.parameters(), 1)
-                self.optim_gpt.step()  # , self.optim_yolox.step()
-                self.optim_gpt.zero_grad()  # , self.optim_yolox.zero_grad()
+                self.optim_gpt.step()
+                self.optim_gpt.zero_grad()
+
+                if self.config.detection_enabled:
+                    self.optim_yolox.step()
+                    self.optim_yolox.zero_grad()
 
                 if self.config.reward_norm:
                     self._compute_last_returns_mean_std()
@@ -303,51 +382,31 @@ class ReinforceTrainer(Trainer):
 
         for loop_id, env_id in enumerate(tqdm(env_ids)):
             batch = dataset.__getitem__(env_id)
-            images = batch["image"].unsqueeze(0).to(self.device)
-            bboxes = bboxes_to_tensor(batch["bboxes"]).unsqueeze(0).to(self.device)
+            plot_traj = loop_id in visual_ids
+            metrics, plot_image = self.eval_on_sample(batch, plot_traj, env_id)
 
-            env = NeedleGeneralEnv(
-                images,
-                bboxes,
-                self.patch_size,
-                self.max_ep_len,
-                self.n_glimps_levels,
-                self.stop_enabled,
-            )
-
-            rollout = self.rollout(env)
-            metrics = self.compute_metrics(rollout)
-
-            # Additional metrics for test
-            # TODO put in another method
-            metrics["prop_patches_found"] = env.prop_patches_found[0]
-            metrics["prop_bbox_found"] = env.prop_bboxes_found[0]
-
-            if self.stop_enabled:
-                metrics["stop_used"] = env.terminated[0].to(torch.float32)
-                metrics["stop_misused"] = (
-                    env.terminated[0] and env.prop_patches_found[0] < 1
-                ).to(torch.float32)
+            if plot_traj:
+                plot_images["model_images"].append(plot_image)
 
             for key, value in metrics.items():
                 all_metrics[key].append(value.cpu())
 
-            if loop_id in visual_ids:
-                positions, masks, patches = self.predict(env)
+        # Select worst images
+        if self.config.failure_select_rate > 0:
+            worst_img_count = int(self.config.failure_select_rate * len(dataset))
+            metrics_array = np.array(all_metrics[self.best_metric_name])
+            worst_ids = np.argsort(metrics_array)[:worst_img_count]
+            plot_images["worst_images"] = []
+            print("Evaluate worst images for plotting")
 
-                # Generate image
-                plot_image = plot_model_prediction(
-                    env.images[
-                        0, 0
-                    ].cpu(),  # XXX: we have to select the first glimps level
-                    patches[0].cpu(),  # first of batch
-                    positions[0][masks[0] == 1].cpu(),
-                    true_bboxes=[],  # TODO ground truth bboxes
-                    predicted_bboxes=[],
-                )
-                plot_images["model_images"].append(plot_image)
+            for worst_id in tqdm(worst_ids):
+                worst_env_id = env_ids[worst_id]
+                batch = dataset.__getitem__(env_id)
+                metrics, plot_image = self.eval_on_sample(batch, True)
+                plot_images["worst_images"].append(plot_image)
 
         dataset.translations, dataset.rotations = translations, rotations
+        self.model.train()
 
         self.last_test_metrics = all_metrics
         self.best_metric_history.append(np.mean(all_metrics[self.best_metric_name]))
@@ -355,65 +414,80 @@ class ReinforceTrainer(Trainer):
         self.save_state()
         self.save_metrics()
 
-    @torch.no_grad()
-    def predict(
-        self, env: NeedleGeneralEnv, sample_actions: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluates the model on a batch of images.
-        Return a plot of its trajectories on all images.
-
-        ---
-        Args:
-            env: The environment to evaluate the model on.
-
-        ---
-        Returns:
-            positions: The positions visited by the model.
-                Shape of [batch_size, max_ep_len + 1, 2].
-            masks: The masks of the visited positions.
-                Shape of [batch_size, max_ep_len + 1].
+    def eval_on_sample(self, batch, plot_traj: bool, *args):
         """
-        self.model.eval()
-        classes = torch.zeros((env.batch_size,), dtype=torch.int64, device=self.device)
-        actions = torch.zeros((env.batch_size, 1), dtype=torch.long, device=self.device)
-        patches, infos = env.reset()
-        positions = infos["positions"].unsqueeze(1)
+        Evaluate an image
+        """
+        images = batch["image"].unsqueeze(0).to(self.device)
+        bboxes = bboxes_to_tensor(batch["bboxes"]).unsqueeze(0).to(self.device)
 
-        masks = torch.zeros(
-            (env.batch_size, env.max_ep_len + 1),
-            dtype=torch.bool,
-            device=self.device,
+        env = NeedleGeneralEnv(
+            images,
+            bboxes,
+            self.patch_size,
+            self.max_ep_len,
+            self.n_glimps_levels,
+            self.stop_enabled,
         )
-        masks[:, 0] = True
 
-        for step_id in range(env.max_ep_len):
-            logits = self.model(patches, actions, classes, positions)
-            if sample_actions:
-                new_actions, _, _ = self.sample_from_logits(logits)
-            else:
-                new_actions = logits[:, -1].argmax(dim=-1)
+        rollout = self.rollout(
+            env, sample_actions=False, do_detection=self.config.detection_enabled
+        )
+        metrics = self.compute_metrics(rollout, env)
 
-            new_patches, _, terminated, _, infos = env.step(new_actions)
-            masks[:, step_id + 1] = ~terminated
+        positions = rollout["positions"]
+        masks = rollout["masks"]
+        patches = rollout["patches"]
+        full_img_targets = [[]]
+        full_img_preds = [[]]
 
-            # Append for the next iteration of the model
-            actions = torch.concat((actions, new_actions.unsqueeze(1)), dim=1)
-            patches = torch.concat((patches, new_patches), dim=1)
-            positions = torch.concat(
-                (positions, infos["positions"].unsqueeze(1)), dim=1
+        if self.config.detection_enabled:
+            # Convert to list
+            full_img_targets = env.get_detection_targets()
+
+            # metrics over trajectories
+            traj_bbox_preds = rollout["bboxes"]
+            # convert position y, x to x, y
+            offsets = positions[:, :, [1, 0]] * self.patch_size
+            full_img_preds = Trainer.patch_bboxes2full_image(
+                traj_bbox_preds, offsets, masks
             )
 
-            if terminated:
-                break
+            if self.config.merge_bboxes:
+                full_img_preds = merge_boxes_batched(full_img_preds, target=False)
+                full_img_targets = merge_boxes_batched(full_img_targets, target=True)
 
-        # The last terminated state is not counted in the masks,
-        # so we need to shift the masks by 1 to make sure we include id.
-        masks = torch.roll(masks, shifts=1, dims=(1,))
-        masks[:, 0] = True
+            traj_yolo_metrics = Trainer.compute_detection_metrics(
+                full_img_preds,
+                full_img_targets,
+            )
 
-        # complete positions so that they are the same size as masks
-        positions = F.pad(
-            positions, (0, 0, 0, env.max_ep_len - positions.shape[1] + 1), value=0
-        )
+            for metric_name, metric_value in traj_yolo_metrics.items():
+                metrics[metric_name] = metric_value
+            # TODO add yolo false positive metric
 
-        return positions, masks, patches
+            # metrics over full image
+            target_patches, target_bboxes = env.get_detection_batch(sample_neg=0)
+            yolox = self.yolox_model()
+            pred_bboxes, _, yolo_losses = yolox(target_patches)
+
+            yolo_metrics = Trainer.compute_detection_metrics(pred_bboxes, target_bboxes)
+
+            yolo_metrics.update(yolo_losses)
+
+            for metric_name, metric_value in yolo_metrics.items():
+                metrics["yolo_" + metric_name] = metric_value
+
+        plot_image = None
+
+        if plot_traj:
+            # Generate image
+            plot_image = plot_model_prediction(
+                env.images[0, 0].cpu(),  # XXX: we have to select the first glimps level
+                patches[0].cpu(),  # first of batch
+                positions[0][masks[0] == 1].cpu(),
+                true_bboxes=parse_bbox_targets(torch.stack(full_img_targets)),
+                predicted_bboxes=parse_bbox_predictions(full_img_preds),
+            )
+
+        return metrics, plot_image

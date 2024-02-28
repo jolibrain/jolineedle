@@ -15,22 +15,25 @@ import numpy as np
 from torchvision.ops import nms
 
 from einops import rearrange
-from kornia import augmentation
 from torch.distributed import destroy_process_group, init_process_group
 from torch.distributions import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
-from torchvision.ops import box_convert
 from tqdm import tqdm
+from torchvision.ops import box_convert
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 from .dataset import NeedleDataset
 from .env.simple_env import NeedleSimpleEnv, Action, Position, BBox
 from .env import get_actions_info
 from .models.gpt import GPT
-from .models.yolox import NeedleYOLOX
-from .utils import CfgNode as CN, plot_model_prediction
+from .utils import (
+    CfgNode as CN,
+    plot_model_prediction,
+    parse_bbox_targets,
+    parse_bbox_predictions,
+)
 from .trainer import Trainer
 from .logger import Logger
 
@@ -194,6 +197,9 @@ class SupervisedTrainer(Trainer):
         metrics["episode_length"] = masks.sum(dim=1).float().mean()
         return metrics
 
+    # Deprecated, should use compute_detection_metrics instead
+    # compute_detection_metrics computes MAP over the full image instead of
+    # per patch, which can change the result
     def compute_yolo_metrics(
         self,
         outputs: List[List[Optional[torch.Tensor]]],
@@ -211,7 +217,7 @@ class SupervisedTrainer(Trainer):
                 Shape of [batch_size, n_tokens, n_bboxes, class_id + 4 + 1].
                 The last dimension is organized as follows:
                     - [class_id,]: The bbox's class.
-                    - [cx, cy, w, h]: The coordinates of the bbox.
+                    - [xmin, ymin, xmax, ymax]: The coordinates of the bbox.
                     - [1,]: Whether the bbox is a true bbox or not (objectiveness).
         """
         metrics = dict()
@@ -268,8 +274,6 @@ class SupervisedTrainer(Trainer):
                 tgts.append(target)
 
         metrics["map"] = map(preds, tgts)["map_50"]
-        self.yolo_metrics = metrics
-
         return metrics
 
     @torch.no_grad()
@@ -320,7 +324,7 @@ class SupervisedTrainer(Trainer):
             select_action = lambda logits: logits.argmax()
 
         for index in range(1, max_ep_len):
-            action_logits = self.model(
+            action_logits, embeddings = self.model(
                 sample["patches"].unsqueeze(0),
                 sample["current_actions"].unsqueeze(0),
                 classes=sample["class_id"].unsqueeze(0),
@@ -360,16 +364,13 @@ class SupervisedTrainer(Trainer):
 
         # Compute some metrics to plot.
         # Loss metrics.
-        if isinstance(self.model, DDP):
-            bbox_outs, _, yolo_loss = self.model.module.yolox(
-                sample["patches"].unsqueeze(0),
-                sample["local_bboxes"].unsqueeze(0),
-            )
-        else:
-            bbox_outs, _, yolo_loss = self.model.yolox(
-                sample["patches"].unsqueeze(0),
-                sample["local_bboxes"].unsqueeze(0),
-            )
+        yolox = (
+            self.model.module.yolox if isinstance(self.model, DDP) else self.model.yolox
+        )
+        bbox_outs, _, yolo_loss = yolox(
+            sample["patches"],
+            sample["local_bboxes"],
+        )
         yolo_loss = {
             name: value.cpu() if isinstance(value, torch.Tensor) else value
             for name, value in yolo_loss.items()
@@ -401,10 +402,13 @@ class SupervisedTrainer(Trainer):
             else 0.0
         )
 
-        return sample, metrics, bbox_outs[0]
+        return sample, metrics, bbox_outs
 
     @torch.no_grad()
     def eval_supervised(self, dataset, env_ids):
+        """
+        Evaluate the model on supervised trajectories. We measure the action accuracy.
+        """
         print("Evaluating on supervised trajectories...")
         all_metrics = defaultdict(list)
         subset = torch.utils.data.Subset(
@@ -435,7 +439,7 @@ class SupervisedTrainer(Trainer):
             patches_yolox = batch["patches_yolox"].to(device)
             bboxes_yolox = batch["bboxes_yolox"].to(device)
 
-            action_logits = self.model(
+            action_logits, embeddings = self.model(
                 patches,
                 current_actions,
                 classes=classes,
@@ -453,14 +457,12 @@ class SupervisedTrainer(Trainer):
             else:
                 reference_actions = next_actions
 
-            if isinstance(self.model, DDP):
-                bbox_outs, _, yolo_loss = self.model.module.yolox(
-                    patches_yolox.unsqueeze(0), bboxes_yolox.unsqueeze(0)
-                )
-            else:
-                bbox_outs, _, yolo_loss = self.model.yolox(
-                    patches_yolox.unsqueeze(0), bboxes_yolox.unsqueeze(0)
-                )
+            yolox = (
+                self.model.module.yolox
+                if isinstance(self.model, DDP)
+                else self.model.yolox
+            )
+            bbox_outs, _, yolo_loss = yolox(patches_yolox, bboxes_yolox)
 
             metrics = self.compute_metrics(
                 action_logits,
@@ -469,12 +471,12 @@ class SupervisedTrainer(Trainer):
                 yolo_loss,
             )
 
-            yolo_metrics = self.compute_yolo_metrics(
-                bbox_outs, bboxes_yolox.unsqueeze(0)
+            self.yolo_metrics = self.compute_yolo_metrics(
+                [bbox_outs], bboxes_yolox.unsqueeze(0)
             )
 
             for metric_name, metric_values in chain(
-                metrics.items(), yolo_metrics.items()
+                metrics.items(), self.yolo_metrics.items()
             ):
                 all_metrics[metric_name].append(metric_values.cpu().item())
 
@@ -490,7 +492,8 @@ class SupervisedTrainer(Trainer):
         """
         Compute the MAP by accounting for the patches missed by the decision model.
 
-        We count the missing patches as false negatives, as if the model predicted nothing.
+        We count the missing patches as false negatives, as if the model predicted
+        nothing.
         """
         env, _ = self.create_env(dataset[env_id])
         env.reset()
@@ -560,8 +563,8 @@ class SupervisedTrainer(Trainer):
             bboxes = env.local_bboxes().unsqueeze(0).unsqueeze(0)
             targets = torch.cat([bboxes, targets], dim=1)
 
-        metrics = self.compute_yolo_metrics(list_predicted, targets)
-        return metrics
+        self.yolo_metrics = self.compute_yolo_metrics(list_predicted, targets)
+        return self.yolo_metrics
 
     def metrics_from_multiple_samples(
         self, env: NeedleSimpleEnv, samples: list, bboxes: list
@@ -621,8 +624,8 @@ class SupervisedTrainer(Trainer):
                 bboxes_ids = nms(bboxes[:, :4], bboxes[:, -1], iou_threshold=0.5)
                 list_predicted[batch_id][patch_id] = bboxes[bboxes_ids]
 
-        metrics = self.compute_yolo_metrics(list_predicted, targets)
-        metrics["prop_patches_found"] = torch.tensor(
+        self.yolo_metrics = self.compute_yolo_metrics(list_predicted, targets)
+        self.yolo_metrics["prop_patches_found"] = torch.tensor(
             len(visited_patches & env.bbox_patches) / len(env.bbox_patches)
             if len(env.bbox_patches) > 0
             else 0.0
@@ -630,7 +633,7 @@ class SupervisedTrainer(Trainer):
 
         env.position = current_env_pos
 
-        return metrics
+        return self.yolo_metrics
 
     def eval_envs(
         self,
@@ -713,12 +716,12 @@ class SupervisedTrainer(Trainer):
                 env, _ = self.create_env(
                     dataset.__getitem__(env_id, np.random.default_rng(loop_id))
                 )
-                true_bboxes = NeedleYOLOX.parse_bbox_targets(
+                true_bboxes = parse_bbox_targets(
                     sample["local_bboxes"].cpu(),
                     sample["positions"].cpu(),
                     env.patch_size,
                 )
-                predicted_bboxes = NeedleYOLOX.parse_bbox_predictions(
+                predicted_bboxes = parse_bbox_predictions(
                     bboxes, sample["positions"], env.patch_size
                 )
                 image = plot_model_prediction(
@@ -808,19 +811,9 @@ class SupervisedTrainer(Trainer):
 
     def run(self, rank: int, world_size: int, port: int):
         self.ddp_setup(rank, world_size, port)
+        self.init_detection()
         self.model = DDP(self.model, device_ids=[self.device])
         model, config = self.model, self.config
-
-        augment = nn.Sequential(
-            augmentation.RandomPlanckianJitter(mode="CIED"),
-            augmentation.RandomGrayscale(p=0.2),
-            augmentation.RandomGaussianBlur((3, 3), sigma=(0.1, 2.0)),
-            augmentation.RandomPlasmaShadow(
-                shade_intensity=(-0.2, 0.0), shade_quantity=(0.0, 0.4), p=0.5
-            ),
-            augmentation.RandomGaussianNoise(mean=0.0, std=0.05, p=0.5),
-            augmentation.RandomMotionBlur(3, (-180.0, 180.0), 0.0, p=0.3),
-        )
 
         # setup the dataloader
         train_loader = DataLoader(
@@ -862,12 +855,12 @@ class SupervisedTrainer(Trainer):
             with torch.no_grad():
                 batch_size = patches.shape[0]
                 patches = einops.rearrange(patches, "b t c h w -> (b t) c h w")
-                patches = augment(patches)
+                patches = self.detection_augment(patches)
                 patches = einops.rearrange(
                     patches, "(b t) c h w -> b t c h w", b=batch_size
                 )
 
-            action_logits = model(
+            action_logits, embeddings = model(
                 patches,
                 current_actions,
                 classes=classes,
@@ -889,16 +882,10 @@ class SupervisedTrainer(Trainer):
             patches_yolox = batch["patches_yolox"].to(self.device)
             bboxes_yolox = batch["bboxes_yolox"].to(self.device)
             with torch.no_grad():
-                patches_yolox = augment(patches_yolox)
+                patches_yolox = self.detection_augment(patches_yolox)
 
-            if isinstance(model, DDP):
-                _, _, yolo_loss = model.module.yolox(
-                    patches_yolox.unsqueeze(0), bboxes_yolox.unsqueeze(0)
-                )
-            else:
-                _, _, yolo_loss = model.yolox(
-                    patches_yolox.unsqueeze(0), bboxes_yolox.unsqueeze(0)
-                )
+            yolox = self.yolox_model()
+            _, _, yolo_loss = yolox(patches_yolox, bboxes_yolox)
 
             self.last_train_metrics = self.compute_metrics(
                 action_logits,
