@@ -106,6 +106,155 @@ def bboxes_to_tensor(bboxes: List[BBox]):
     )
 
 
+def parse_bbox_predictions(
+    outputs: List[Optional[torch.Tensor]],
+    positions: Optional[torch.Tensor] = None,
+    patch_size: int = 1,
+) -> List[BBox]:
+    """Parse the predicted bboxes of a single image, by producing a list of BBoxes.
+
+    ---
+    Args:
+        outputs: List of predicted bboxes, one tensor for each positions.
+            Each tensor is of shape [n_bboxes, 4 + num_classes + 1].
+        positions: Tensor of positions. If no positions are provided, bbox coordinates are not modified.
+            Shape of [n_patches, 2].
+        patch_size: Size of a single patch.
+
+    ---
+    Returns:
+        The global list of bboxes for the image.
+    """
+    parsed_bboxes = []
+    for i, bboxes in enumerate(outputs):
+        if bboxes is None:
+            continue  # No bbox predicted for this position.
+        bboxes = bboxes[:, :4]  # Get the bbox positions.
+
+        if positions is not None:
+            position = positions[i]
+            for x_id in [0, 2]:
+                bboxes[:, x_id] = bboxes[:, x_id] + position[1] * patch_size
+            for y_id in [1, 3]:
+                bboxes[:, y_id] = bboxes[:, y_id] + position[0] * patch_size
+
+        for bbox in bboxes:
+            bbox = bbox.cpu()
+            parsed_bboxes.append(
+                BBox(
+                    up_left=Position(x=bbox[0].item(), y=bbox[1].item()),
+                    bottom_right=Position(x=bbox[2].item(), y=bbox[3].item()),
+                )
+            )
+
+    return parsed_bboxes
+
+
+def parse_bbox_targets(
+    targets: torch.Tensor, positions: Optional[torch.Tensor] = None, patch_size: int = 1
+) -> List[BBox]:
+    """
+
+    ---
+    Args:
+        targets: The target sample.
+            Shape of [n_patches, n_bboxes, class_id + 4 + 1].
+        positions: Tensor of positions. If no positions are provided, bbox coordinates are not modified.
+            Shape of [n_patches, 2].
+        patch_size: Size of a single patch.
+    """
+    # Swap the class and the area predictions.
+    targets2 = targets.clone()
+    targets[..., :4], targets[..., 4] = targets2[..., 1:5], targets2[..., 0]
+    # Remove non-existing bboxes, replacing them by `None`.
+    filtered_targets = []
+    for bboxes in targets:
+        filtered_bboxes = []
+        for bbox in bboxes:
+            if bbox[-1] == 1:
+                filtered_bboxes.append(bbox)
+        filtered_bboxes = (
+            torch.stack(filtered_bboxes) if len(filtered_bboxes) > 0 else None
+        )
+        filtered_targets.append(filtered_bboxes)
+    # # Add the `n_bboxes` dimension.
+    # targets = [t.unsqueeze(0) if t is not None else t for t in targets]
+    return parse_bbox_predictions(targets, positions, patch_size)
+
+
+def merge_boxes_batched(
+    batch: List[Optional[torch.Tensor]], threshold: int = 2, target: bool = False
+) -> List[torch.Tensor]:
+    result = []
+    for boxes in batch:
+        if boxes is None:
+            result.append(None)
+        else:
+            result.append(merge_boxes(boxes, threshold, target))
+
+    return result
+
+
+def merge_boxes(
+    boxes: torch.Tensor, threshold: int = 2, target: bool = False
+) -> torch.Tensor:
+    """
+    Merge contiguous bboxes obtained from patch prediction.
+    If the boxes tensor includes score, the highest score of
+    all merged boxes is kept
+
+    target: whether box is in target form (cls, xmin, ymin, xmax, ymax)
+    or in prediction form (xmin, ymin, xmax, ymax, obj_conf, cls_confs...)
+    """
+    off = 1 if target else 0
+
+    def dist(a: torch.Tensor, b: torch.Tensor):
+        d1 = abs(b[off + 2] - a[off + 0])
+        d2 = abs(a[off + 2] - b[off + 0])
+        d3 = abs(b[off + 3] - a[off + 1])
+        d4 = abs(a[off + 3] - b[off + 1])
+        return min(d1, d2, d3, d4)
+
+    groups = []
+
+    for i in range(len(boxes)):
+        if boxes[i] is None:
+            continue
+
+        for groupid in range(len(groups)):
+            if i in groups[groupid]:
+                break
+        else:
+            groupid = len(groups)
+            groups.append([i])
+
+        for j in range(i + 1, len(boxes)):
+            if boxes[j] is None:
+                continue
+
+            if dist(boxes[i], boxes[j]) <= threshold:
+                groups[groupid].append(j)
+
+    merged_boxes = []
+    for group in groups:
+        to_merge = [boxes[i] for i in group]
+        xmin = [box[off + 0] for box in to_merge]
+        ymin = [box[off + 1] for box in to_merge]
+        xmax = [box[off + 2] for box in to_merge]
+        ymax = [box[off + 3] for box in to_merge]
+        merged_box = [min(xmin), min(ymin), max(xmax), max(ymax)]
+        # confidence
+        if target:
+            merged_box = [0] + merged_box
+        elif boxes.shape[1] > 5:
+            conf = max([box[4] * box[5] for box in to_merge])
+            merged_box += [conf, 1]
+
+        merged_boxes.append(torch.tensor(merged_box, device=boxes.device))
+
+    return torch.stack(merged_boxes)
+
+
 # Plotting
 
 
@@ -154,9 +303,9 @@ def plot_patches(
     patch_h, patch_w, n_channels = patches[0].shape
     image = np.zeros((height, width, n_channels))
     for patch, position in zip(patches, positions):
-        image[
-            position.y : position.y + patch_h, position.x : position.x + patch_w
-        ] = patch
+        image[position.y : position.y + patch_h, position.x : position.x + patch_w] = (
+            patch
+        )
     axe.imshow(image, vmin=0, vmax=1, alpha=0.3)
 
 

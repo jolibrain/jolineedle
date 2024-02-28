@@ -1,6 +1,7 @@
 import pickle
 from collections import defaultdict
 from pathlib import Path
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -116,7 +117,13 @@ class VisdomPlotter:
                 Y.append(data)
                 names.append(line_name)
 
-            Y = np.array(Y).T  # [n_points, n_lines]
+            try:
+                Y = np.array(Y).T  # [n_points, n_lines]
+            except ValueError:
+                traceback.print_exc()
+                print("Skip graph %s" % str(names))
+                continue
+
             X = np.arange(len(Y))
             self.vis.line(
                 Y,

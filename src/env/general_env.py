@@ -5,6 +5,7 @@ import torch
 import torchvision.transforms.functional as TF
 
 from torch import Tensor
+import torch.nn.functional as F
 from kornia.geometry.boxes import Boxes
 
 from .common import Action, ACTION_DELTAS
@@ -80,6 +81,7 @@ class NeedleGeneralEnv(gym.Env):
         # Initialize some variables for the environment.
         self.init_env_variables()
 
+    @torch.no_grad()
     def init_glimps_images(self, images: torch.Tensor):
         """Build the glimps images from the original images.
         They represent progressive lower resolution images.
@@ -113,7 +115,7 @@ class NeedleGeneralEnv(gym.Env):
         self.images = torch.stack(glimps_images, dim=1)
 
     def init_env_variables(self):
-        # Positions of the agents in the images.
+        # Positions of the agents in the images. (y, x)
         self.positions = torch.zeros(
             (self.batch_size, 2),
             dtype=torch.long,
@@ -139,7 +141,7 @@ class NeedleGeneralEnv(gym.Env):
             device=self.device,
         )
 
-    def reset(self) -> Tuple[Tensor, dict]:
+    def reset(self, positions=None) -> Tuple[Tensor, dict]:
         """Reset the environment variables.
         Randomly initialize the positions of the agents.
 
@@ -150,18 +152,21 @@ class NeedleGeneralEnv(gym.Env):
             infos: Additional infos.
         """
         self.init_env_variables()
-        self.positions[:, 0] = torch.randint(
-            low=0, high=self.n_vertical_patches, size=(self.batch_size,)
-        )
-        self.positions[:, 1] = torch.randint(
-            low=0, high=self.n_horizontal_patches, size=(self.batch_size,)
-        )
+        if positions is not None:
+            self.positions = positions
+        else:
+            self.positions[:, 0] = torch.randint(
+                low=0, high=self.n_vertical_patches, size=(self.batch_size,)
+            )
+            self.positions[:, 1] = torch.randint(
+                low=0, high=self.n_horizontal_patches, size=(self.batch_size,)
+            )
         self.visited_patches = self.visited_patches | self.tiles_reached
 
         infos = {
             "positions": self.positions,
         }
-        patches = self.patches / 255
+        patches = self.patches
         return patches, infos
 
     @torch.no_grad()
@@ -198,8 +203,7 @@ class NeedleGeneralEnv(gym.Env):
             "positions": self.positions,
         }
 
-        patches = self.patches / 255
-
+        patches = self.patches
         return patches, rewards, self.terminated, truncated, infos
 
     def actions_to_movements(self, actions):
@@ -280,53 +284,26 @@ class NeedleGeneralEnv(gym.Env):
 
     @property
     def patches(self) -> Tensor:
-        """Fetch the patches of the images that the agents have reached.
-        Return all patches of the trajectories.
+        """Fetch the patches of the images where the agents currently are.
 
         ---
         Returns:
             The batch of patches reached.
-                Shape of [batch_size, n_channels, patch_size, patch_size].
+                Shape of [batch_size, glimps_level, n_channels, patch_size, patch_size].
         """
-        # Compute the indices of the pixels of the first patch.
-        row_indices = torch.arange(
-            start=0,
-            end=self.patch_size,
-            device=self.device,
-        )
-        offsets = torch.arange(
-            start=0,
-            end=self.patch_size * self.width,
-            step=self.width,
-            device=self.device,
-        )
-        # This adds the offset to each row index, making it
-        # a [patch_size, patch_size] tensor of indices.
-        pixel_indices = row_indices.unsqueeze(0) + offsets.unsqueeze(1)
-
-        # Add a starting offset to the indices depending on the
-        # agent's position in the images.
-        pixel_indices = einops.rearrange(pixel_indices, "h w -> (h w)")
-        offsets = (
-            self.positions[:, 0] * (self.width * self.patch_size)
-            + self.positions[:, 1] * self.patch_size
-        )
-        # Add the offset of the first pixel index of each agent to the global
-        # patch indices, making it a [batch_size, patch_size x patch_size] tensor.
-        pixel_indices = pixel_indices.unsqueeze(0) + offsets.unsqueeze(1)
-
-        # Add the channels dimension.
-        pixel_indices = einops.repeat(
-            pixel_indices, "b p -> b g c p", c=self.n_channels, g=self.n_glimps_levels
-        )
-
-        # Finally gather the pixels.
-        images = einops.rearrange(self.images, "b g c h w -> b g c (h w)")
-        patches = torch.gather(images, dim=3, index=pixel_indices)
-        patches = einops.rearrange(
-            patches, "b g c (h w) -> b g c h w", h=self.patch_size
-        )
-        return patches
+        patches = []
+        for i, pos in enumerate(self.positions):
+            patch = self.images[
+                i,
+                :,
+                :,
+                pos[0] * self.patch_size : (pos[0] + 1) * self.patch_size,
+                pos[1] * self.patch_size : (pos[1] + 1) * self.patch_size,
+            ]
+            assert patch.shape[-1] == self.patch_size, self.images.shape[-1]
+            assert patch.shape[-2] == self.patch_size, self.images.shape[-2]
+            patches.append(patch)
+        return torch.stack(patches)
 
     @property
     def prop_patches_found(self) -> Tensor:
@@ -406,11 +383,6 @@ class NeedleGeneralEnv(gym.Env):
         Each bounding box of an image is given an id, which will serve as an
         index in the dimension `n_bboxes` of the tensors.
 
-        This implementation is slow and not necessary.
-        It keeps the original bboxes in the patches, which can be useful
-        if you want to train a detector. Since the goal of the agent is only
-        to find the patches where there are bounding boxes, it is not necessary.
-
         ---
         Args:
             bboxes: The bounding boxes of the batch.
@@ -470,42 +442,42 @@ class NeedleGeneralEnv(gym.Env):
             patch_y = bbox[1] // patch_size
 
             # Make sure the bounding box does not go outside the patch.
-            x2_clampled = torch.clamp(x2, max=patch_size - 1)
-            y2_clampled = torch.clamp(y2, max=patch_size - 1)
+            x2_clamped = torch.clamp(x2, max=patch_size - 1)
+            y2_clamped = torch.clamp(y2, max=patch_size - 1)
 
             # Save the bounding box.
             bboxes[patch_y, patch_x, bbox_id] = torch.LongTensor(
-                [x1, y1, x2_clampled, y2_clampled]
+                [x1, y1, x2_clamped, y2_clamped]
             ).to(bboxes.device)
             masks[patch_y, patch_x, bbox_id] = True
 
             # Recursively place the bounding box in the other patches,
             # if the bounding box cross the borders of the current patch.
-            if x2 - x2_clampled > 0:
+            if x2 - x2_clamped > 0:
                 # The bounding box cross the right border of the patch.
                 n_bbox = torch.LongTensor(
                     [
                         (patch_x + 1) * patch_size,
                         bbox[1],
                         bbox[2],
-                        patch_y * patch_size + y2_clampled,
+                        patch_y * patch_size + y2_clamped,
                     ]
                 )
                 place_bbox_recursive(n_bbox, bbox_id, bboxes, masks, patch_size)
 
-            if y2 - y2_clampled > 0:
+            if y2 - y2_clamped > 0:
                 # The bounding box cross the bottom border of the patch.
                 n_bbox = torch.LongTensor(
                     [
                         bbox[0],
                         (patch_y + 1) * patch_size,
-                        patch_x * patch_size + x2_clampled,
+                        patch_x * patch_size + x2_clamped,
                         bbox[3],
                     ]
                 )
                 place_bbox_recursive(n_bbox, bbox_id, bboxes, masks, patch_size)
 
-            if (x2 - x2_clampled > 0) and (y2 - y2_clampled > 0):
+            if (x2 - x2_clamped > 0) and (y2 - y2_clamped > 0):
                 # The bounding box cross the bottom-right corner of the patch.
                 n_bbox = torch.LongTensor(
                     [
@@ -519,6 +491,8 @@ class NeedleGeneralEnv(gym.Env):
 
         for batch_id, bboxes_ in enumerate(bboxes):
             for bbox_id, bbox in enumerate(bboxes_):
+                # XXX: sometimes we get floating point bboxes which are not supported
+                bbox = bbox.int()
                 place_bbox_recursive(
                     bbox,
                     bbox_id,
@@ -528,3 +502,72 @@ class NeedleGeneralEnv(gym.Env):
                 )
 
         return tensor_bboxes, masks
+
+    @torch.no_grad()
+    def get_detection_batch(self, sample_neg=1):
+        """
+        Get patches and bboxes to train the detection model. Patches
+        are sampled from current images, all patches with bbox are included.
+
+        With "sample_neg", patches without bboxes can be included as well
+
+        Return:
+            patches: [patch_count, n_channels, patch_size, patch_size]
+            bboxes: [patch_count, n_bboxes, 1 + 4]
+            sample_neg: number of patches without bbox included in the batch
+        """
+        boxes, masks = self.parse_bboxes(self.bboxes)
+        masks = masks.squeeze(-1)
+        patches = []
+        all_bboxes = []
+
+        for i in range(self.batch_size):
+            pos_ids = torch.where(masks[i])
+            neg_ids = torch.where(~masks[i])
+            neg_select = torch.randperm(len(neg_ids[0]))[:sample_neg]
+            neg_ids = tuple(u[neg_select] for u in neg_ids)
+            ids = tuple(torch.cat((p, n)) for p, n in zip(pos_ids, neg_ids))
+
+            for j in range(len(ids[0])):
+                x, y = ids[0][j], ids[1][j]
+                patch = self.images[
+                    i,
+                    0,  # glimps
+                    :,
+                    x * self.patch_size : (x + 1) * self.patch_size,
+                    y * self.patch_size : (y + 1) * self.patch_size,
+                ]
+                assert patch.shape[-1] == self.patch_size, self.images.shape[-1]
+                assert patch.shape[-2] == self.patch_size, self.images.shape[-2]
+                patches.append(patch)
+                # pad bbox to add the class id
+                all_bboxes.append(F.pad(boxes[i, x, y], (1, 0)))
+
+        return torch.stack(patches), torch.stack(all_bboxes)
+
+    @torch.no_grad()
+    def get_detection_targets(self):
+        patch_bbox_targets = self.parse_bboxes(self.bboxes)[0]
+        full_img_targets = []
+
+        for i in range(patch_bbox_targets.shape[0]):
+            img_targets = []
+
+            for y in range(patch_bbox_targets.shape[1]):
+                for x in range(patch_bbox_targets.shape[2]):
+                    for k in range(patch_bbox_targets.shape[3]):
+                        box = patch_bbox_targets[i, y, x, k]
+                        if torch.sum(torch.abs(box)) < 0.001:
+                            # empty bbox: skip
+                            continue
+
+                        pos = torch.tensor([x, y], device=box.device) * self.patch_size
+                        box = box.clone()
+                        box[:2] += pos
+                        box[2:4] += pos
+                        # add class
+                        img_targets.append(F.pad(box, (1, 0)))
+
+            full_img_targets.append(torch.stack(img_targets))
+
+        return full_img_targets
