@@ -1,0 +1,15 @@
+torch>=2.0.1
+torchvision>=0.15.2
+visdom>=0.2.4
+pandas>=2.0.2
+einops>=0.6.1
+tqdm>=4.65.0
+scikit-learn>=1.2.2
+torchinfo>=1.8.0
+kornia>=0.6.12
+torchmetrics[detection]>=0.11.4
+positional-encodings[pytorch]>=6.0.1
+plotly>=5.15.0
+pytest>=7.4.0
+thop
+gymnasium
