@@ -56,6 +56,7 @@ class NeedleYOLOX(YOLOX):
 
             # Training mode, to compute the loss.
             if targets is not None:
+                targets = targets.clone()
                 targets[:, :, 1:5] = box_convert(targets[:, :, 1:5], "xyxy", "cxcywh")
 
                 self.train()
