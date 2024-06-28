@@ -264,7 +264,7 @@ class SupervisedTrainer(Trainer):
                 # Keep only the true bboxes.
                 patch_targets = patch_targets[patch_targets[:, -1] == 1]
                 target = {
-                    "boxes": box_convert(patch_targets[:, 1:5], "cxcywh", "xyxy"),
+                    "boxes": patch_targets[:, 1:5],
                     "labels": torch.zeros(
                         len(patch_targets),
                         device=patch_targets.device,
